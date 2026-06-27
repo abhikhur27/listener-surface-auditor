@@ -47,12 +47,27 @@ type listenerFinding struct {
 	Recommendation string      `json:"recommendation"`
 }
 
+type processRollup struct {
+	PID               int      `json:"pid"`
+	Image             string   `json:"image"`
+	Services          []string `json:"services,omitempty"`
+	ListenerCount     int      `json:"listener_count"`
+	WildcardCount     int      `json:"wildcard_count"`
+	PrivateLANCount   int      `json:"private_lan_count"`
+	HighestRiskScore  int      `json:"highest_risk_score"`
+	HighestRiskLabel  string   `json:"highest_risk_label"`
+	HighestRiskPort   int      `json:"highest_risk_port"`
+	RecommendedAction string   `json:"recommended_action"`
+	Ports             []int    `json:"ports"`
+}
+
 type report struct {
 	GeneratedAt       string            `json:"generated_at"`
 	Host              string            `json:"host"`
 	ListenerCount     int               `json:"listener_count"`
 	ExposureBreakdown map[string]int    `json:"exposure_breakdown"`
 	Findings          []listenerFinding `json:"findings"`
+	ProcessRollups    []processRollup   `json:"process_rollups"`
 	TCPStats          map[string]string `json:"tcp_stats,omitempty"`
 }
 
@@ -100,6 +115,7 @@ func run() error {
 		ListenerCount:     len(findings),
 		ExposureBreakdown: buildExposureBreakdown(findings),
 		Findings:          findings,
+		ProcessRollups:    buildProcessRollups(findings),
 		TCPStats:          tcpStats,
 	}
 
@@ -267,6 +283,57 @@ func buildExposureBreakdown(findings []listenerFinding) map[string]int {
 	return breakdown
 }
 
+func buildProcessRollups(findings []listenerFinding) []processRollup {
+	rollupMap := map[int]*processRollup{}
+	for _, finding := range findings {
+		entry, exists := rollupMap[finding.Process.PID]
+		if !exists {
+			entry = &processRollup{
+				PID:               finding.Process.PID,
+				Image:             finding.Process.Image,
+				Services:          append([]string{}, finding.Process.Services...),
+				HighestRiskScore:  finding.RiskScore,
+				HighestRiskLabel:  finding.RiskLabel,
+				HighestRiskPort:   finding.Connection.LocalPort,
+				RecommendedAction: finding.Recommendation,
+			}
+			rollupMap[finding.Process.PID] = entry
+		}
+		entry.ListenerCount++
+		entry.Ports = append(entry.Ports, finding.Connection.LocalPort)
+		switch finding.Exposure {
+		case "wildcard":
+			entry.WildcardCount++
+		case "private-lan":
+			entry.PrivateLANCount++
+		}
+		if finding.RiskScore > entry.HighestRiskScore {
+			entry.HighestRiskScore = finding.RiskScore
+			entry.HighestRiskLabel = finding.RiskLabel
+			entry.HighestRiskPort = finding.Connection.LocalPort
+			entry.RecommendedAction = finding.Recommendation
+		}
+	}
+
+	rollups := make([]processRollup, 0, len(rollupMap))
+	for _, entry := range rollupMap {
+		sort.Ints(entry.Ports)
+		entry.Ports = uniqueSortedInts(entry.Ports)
+		rollups = append(rollups, *entry)
+	}
+
+	sort.Slice(rollups, func(i, j int) bool {
+		if rollups[i].HighestRiskScore != rollups[j].HighestRiskScore {
+			return rollups[i].HighestRiskScore > rollups[j].HighestRiskScore
+		}
+		if rollups[i].ListenerCount != rollups[j].ListenerCount {
+			return rollups[i].ListenerCount > rollups[j].ListenerCount
+		}
+		return rollups[i].Image < rollups[j].Image
+	})
+	return rollups
+}
+
 func classifyExposure(address string) string {
 	normalized := strings.Trim(address, "[]")
 	switch normalized {
@@ -389,6 +456,26 @@ func writeMarkdown(path string, rep report) error {
 		lines = append(lines, "")
 	}
 
+	lines = append(lines, "## Process rollups")
+	for index, process := range rep.ProcessRollups {
+		if index >= 10 {
+			break
+		}
+		lines = append(lines,
+			fmt.Sprintf("### %s (PID %d)", process.Image, process.PID),
+			fmt.Sprintf("- Listener count: `%d`", process.ListenerCount),
+			fmt.Sprintf("- Highest risk: `%s` (%d/100) on port `%d`", process.HighestRiskLabel, process.HighestRiskScore, process.HighestRiskPort),
+			fmt.Sprintf("- Ports: `%s`", joinPorts(process.Ports)),
+			fmt.Sprintf("- Wildcard listeners: `%d`", process.WildcardCount),
+			fmt.Sprintf("- Private LAN listeners: `%d`", process.PrivateLANCount),
+			fmt.Sprintf("- Recommendation: %s", process.RecommendedAction),
+		)
+		if len(process.Services) > 0 {
+			lines = append(lines, fmt.Sprintf("- Services: `%s`", strings.Join(process.Services, ", ")))
+		}
+		lines = append(lines, "")
+	}
+
 	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
 }
 
@@ -407,6 +494,21 @@ func printConsoleSummary(rep report) {
 		fmt.Printf("  %-18s %d\n", key, rep.ExposureBreakdown[key])
 	}
 	fmt.Println()
+	fmt.Println("Top processes:")
+	for index, process := range rep.ProcessRollups {
+		if index >= 5 {
+			break
+		}
+		fmt.Printf("  %-20s ports %-18s highest %3d/100 %-9s wildcard %d lan %d\n",
+			process.Image,
+			joinPorts(process.Ports),
+			process.HighestRiskScore,
+			process.HighestRiskLabel,
+			process.WildcardCount,
+			process.PrivateLANCount,
+		)
+	}
+	fmt.Println()
 	fmt.Println("Top listeners:")
 	for index, finding := range rep.Findings {
 		if index >= 8 {
@@ -421,6 +523,27 @@ func printConsoleSummary(rep report) {
 			finding.Recommendation,
 		)
 	}
+}
+
+func joinPorts(ports []int) string {
+	parts := make([]string, 0, len(ports))
+	for _, port := range ports {
+		parts = append(parts, strconv.Itoa(port))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func uniqueSortedInts(values []int) []int {
+	if len(values) == 0 {
+		return values
+	}
+	result := []int{values[0]}
+	for _, value := range values[1:] {
+		if value != result[len(result)-1] {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func splitEndpoint(value string) (string, int, error) {

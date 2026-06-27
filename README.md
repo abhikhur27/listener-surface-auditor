@@ -13,6 +13,8 @@ A lot of local tools quietly bind ports: dev servers, database containers, remot
 
 It is a local review tool, not a firewall manager.
 
+The latest version also adds process-level rollups so a machine with many listeners is easier to review by owner instead of by port alone.
+
 ## Usage
 
 Basic console audit:
@@ -36,6 +38,7 @@ Include TCP aggregate counters too:
 ## Output
 
 - Console summary with exposure breakdown and top-risk listeners
+- Process-level rollups showing which executables own the broadest or riskiest listener surface
 - Optional JSON report for scripting or archive history
 - Optional Markdown brief for a quick manual review pass
 
